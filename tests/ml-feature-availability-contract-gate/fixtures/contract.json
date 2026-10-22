@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "min_rows": 4,
+  "min_joint_usable_fraction": 1.0,
+  "features": [
+    {"name": "customer_age", "timestamp_field": "profile_updated_at", "max_null_fraction": 0.0, "max_age_hours": 720, "max_stale_fraction": 0.0},
+    {"name": "transaction_count_30d", "timestamp_field": "transactions_updated_at", "max_null_fraction": 0.0, "max_age_hours": 24, "max_stale_fraction": 0.0}
+  ]
+}

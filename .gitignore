@@ -19,3 +19,5 @@ out/
 # Custom
 .wip
 *.py
+!tests/ml-feature-availability-contract-gate/*.py
+__pycache__/

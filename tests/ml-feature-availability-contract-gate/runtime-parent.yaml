@@ -1,0 +1,101 @@
+id: ml-feature-availability-contract-gate-parent-test
+namespace: company.ml
+description: Runtime-only test parent. A failed gate stops artifact verification and toy baseline training.
+
+inputs:
+  - id: candidate_csv
+    type: STRING
+  - id: feature_contract
+    type: JSON
+  - id: evaluation_time
+    type: STRING
+    defaults: "2026-01-02T12:00:00Z"
+
+tasks:
+  - id: gate
+    type: io.kestra.plugin.core.flow.Subflow
+    namespace: "{{ flow.namespace }}"
+    flowId: ml-feature-availability-contract-gate
+    wait: true
+    transmitFailed: true
+    labels:
+      parent_test_execution: "{{ execution.id }}"
+    inputs:
+      candidate_csv: "{{ inputs.candidate_csv }}"
+      feature_contract: "{{ inputs.feature_contract | toJson }}"
+      evaluation_time: "{{ inputs.evaluation_time }}"
+
+  - id: verify_approval
+    type: io.kestra.plugin.scripts.python.Script
+    description: Verify the child manifest, persisted audit, execution identity, and actual downloaded dataset bytes before training.
+    containerImage: python:3.13-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    inputFiles:
+      manifest.json: "{{ outputs.gate.outputs.approval_manifest }}"
+      audit.json: "{{ outputs.gate.outputs.audit_report }}"
+      candidate.csv: "{{ fromJson(read(outputs.gate.outputs.approval_manifest)).dataset.uri }}"
+    env:
+      CHILD_EXECUTION_ID: "{{ outputs.gate.executionId }}"
+      AUDIT_URI: "{{ outputs.gate.outputs.audit_report }}"
+    script: |
+      import hashlib
+      import json
+      import os
+      from pathlib import Path
+
+      manifest = json.loads(Path("manifest.json").read_text(encoding="utf-8"))
+      audit = json.loads(Path("audit.json").read_text(encoding="utf-8"))
+      digest = hashlib.sha256(Path("candidate.csv").read_bytes()).hexdigest()
+      assert manifest["approved"] is True
+      assert audit["approved"] is True and audit["evaluation_complete"] is True
+      assert audit["status"] == "APPROVED" and audit["failure_reasons"] == []
+      assert manifest["execution_id"] == audit["execution_id"] == os.environ["CHILD_EXECUTION_ID"]
+      assert manifest["audit_uri"] == os.environ["AUDIT_URI"]
+      assert manifest["dataset"] == audit["dataset"]
+      assert manifest["dataset"]["sha256"] == digest
+      assert manifest["contract_sha256"] == audit["contract_sha256"]
+      assert manifest["contract_version"] == audit["contract"]["version"]
+      assert manifest["evaluation_time"] == audit["evaluation_time"]
+      assert manifest["joint_usable_fraction"] == audit["joint_usable_fraction"]
+      print("::" + json.dumps({"outputs": {"verified": True, "dataset_sha256": digest}}) + "::")
+
+  - id: training_smoke
+    type: io.kestra.plugin.scripts.python.Script
+    description: Train a toy constant-age baseline from the approved fixture; its artifact proves this downstream task actually ran. This is not a production model.
+    containerImage: python:3.13-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    inputFiles:
+      candidate.csv: "{{ fromJson(read(outputs.gate.outputs.approval_manifest)).dataset.uri }}"
+    env:
+      EXPECTED_SHA256: "{{ outputs.verify_approval.vars.dataset_sha256 }}"
+      CHILD_EXECUTION_ID: "{{ outputs.gate.executionId }}"
+    outputFiles:
+      - baseline-model.json
+    script: |
+      import csv
+      import hashlib
+      import io
+      import json
+      import os
+      from pathlib import Path
+      from statistics import mean
+
+      raw = Path("candidate.csv").read_bytes()
+      digest = hashlib.sha256(raw).hexdigest()
+      assert digest == os.environ["EXPECTED_SHA256"]
+      rows = list(csv.DictReader(io.StringIO(raw.decode("utf-8-sig"))))
+      model = {
+          "model_type": "constant_customer_age_test_only",
+          "prediction": mean(float(row["customer_age"]) for row in rows),
+          "training_rows": len(rows),
+          "dataset_sha256": digest,
+          "gate_execution_id": os.environ["CHILD_EXECUTION_ID"],
+      }
+      Path("baseline-model.json").write_text(json.dumps(model, indent=2), encoding="utf-8")
+
+outputs:
+  - id: model
+    type: FILE
+    value: "{{ outputs.training_smoke.outputFiles['baseline-model.json'] }}"
