@@ -281,99 +281,82 @@ outputs:
 
 extend:
   title: ML Feature Availability Contract Gate
-  metaTitle: ML Feature Availability Contract Gate with Kestra
-  shortDescription: Gate training datasets on per-feature null and freshness limits and joint usable-row coverage, with an audit and dataset-bound approval.
-  metaDescription: Validate per-feature freshness and completeness plus joint usable-row coverage before releasing a dataset-bound ML training approval manifest.
-  tags:
-    - AI
-    - Data
-  ee: false
-  demo: true
+  metaTitle: ML Feature Availability Contract Gate | Kestra
+  shortDescription: Validate required feature completeness, freshness, and joint row coverage before releasing a dataset-bound training approval.
+  metaDescription: Audit training feature nulls, freshness, and joint coverage in Kestra before issuing a dataset-bound ML approval.
   description: |
-    Determine whether an assembled training batch has enough rows where every
-    required feature is simultaneously non-null and fresh. Independent column
-    completeness can hide disjoint missing values; joint coverage catches that.
-    This gate does not detect historical point-in-time leakage, validate feature
-    types or ranges, scan secrets, impute values, or drop unusable rows.
-
-    ## Prerequisites
-    - Kestra with the Python scripts plugin and Docker task runner.
-    - Docker access on the worker and access to the python:3.13-slim image.
-    - No secrets, external services, Python packages, or DuckDB installation.
-      Standard-library streaming CSV validation avoids extra runtime dependencies.
-
-    ## Inputs and contract
-    - candidate_csv (STRING): UTF-8 CSV content; defaults to four deterministic
-      customer records. Header names must be unique and trimmed. Extra columns
-      are permitted. Blank/whitespace-only feature cells count as null; strings
-      such as NULL and NaN are ordinary values. Zero is non-null.
-    - feature_contract (JSON): defaults to version 1, min_rows 4, joint coverage
-      1.0, and two required features. customer_age permits age <=720 hours;
-      transaction_count_30d permits <=24 hours. Both permit zero null/stale rows.
-      Only version, min_rows, min_joint_usable_fraction, and features are accepted.
-      Each feature requires name, timestamp_field, max_null_fraction,
-      max_age_hours, and max_stale_fraction. Unknown fields, duplicate feature
-      names, empty feature lists, booleans as numbers, and unsupported versions fail.
-      min_rows is a positive integer; fractions are finite numbers in [0,1];
-      max_age_hours is finite and nonnegative. Different features may share a timestamp.
-    - evaluation_time (STRING): defaults to 2026-01-02T12:00:00Z for the demo.
-      Empty captures current UTC once. For production supply the batch evaluation
-      time or empty; never leave the fixed demo time for live data.
-
-    ## Semantics
-    All fractions use the complete candidate row count as denominator. Stale
-    means timestamp age strictly exceeds that feature's age limit, even when
-    its value is null. A usable cell is non-null with a valid, nonfuture, fresh
-    timestamp. A jointly usable row has usable cells for every required feature.
-    Equality passes all thresholds; empty datasets always fail. Missing columns,
-    missing/invalid timestamps (including on null feature cells), and future
-    timestamps are hard failures regardless of fractional budgets. Timestamps
-    must be RFC3339 with seconds, optional 1-6 fractional digits, and Z or a
-    numeric offset; unknown -00:00, naive times, and leap seconds are rejected.
-    No future clock-skew allowance is applied. Null and stale counts may overlap.
+    Gate ML training batches on a versioned feature-availability contract. Validate
+    the submitted CSV rather than accepting a preset result; only an eligible batch
+    receives an execution-scoped approval tied to exact data and contract hashes.
 
     ## How it works
-    1. stage_candidate freezes the CSV in execution storage.
-    2. validate_availability hashes those exact bytes, validates the contract,
-       captures the evaluation time, streams the CSV, and uploads audit.json.
-       Expected validation failures return a rejected audit so it survives failure.
-    3. availability_gate releases approval only for an explicit true verdict;
-       otherwise reject_candidate fails the execution after audit persistence.
-    4. release_approval writes a manifest with dataset URI/SHA-256, contract
-       version/hash, evaluation time, execution ID, joint coverage, and audit URI.
-       The contract hash identifies the exact serialized contract.json bytes.
+
+    1. A disabled daily UTC Schedule illustrates recurring use; execute manually
+       with a candidate CSV, JSON contract, and evaluation timestamp.
+    2. stage_candidate stores immutable execution input bytes.
+    3. validate_availability checks contract shape, required columns, null and
+       stale fractions, invalid/future timestamps, minimum rows, and the share
+       of rows where every required feature is present and fresh. It writes audit.json.
+    4. availability_gate writes a checksum-bound approval manifest only on an
+       explicit successful verdict. Otherwise it fails after preserving the audit.
+
+    ## What you get
+
+    - Per-feature counts and thresholds, joint usable-row coverage, failure reasons,
+      and dataset/contract SHA-256 fingerprints in audit.json.
+    - On success, an approval JSON manifest with the staged dataset URI, hashes,
+      evaluation time, execution ID, and audit location.
+    - Fail-closed behavior for missing columns, malformed inputs, or unsafe timestamps.
+      Approval covers the batch, not a filtered dataset of exclusively usable rows.
+
+    ## Who it's for
+
+    ML engineers, data engineers, and platform teams validating assembled feature
+    batches before downstream training or evaluation jobs.
+
+    ## Why orchestrate this with Kestra
+
+    Kestra persists input artifacts and audit evidence, routes approval or rejection,
+    and makes the training dependency explicit. A training flow can call this gate
+    as a waiting Subflow with transmitFailed=true and verify the checksum before use.
+
+    ## Prerequisites
+
+    - Kestra 2.0 with Core and the Python Script plugin.
+    - A Docker-capable worker able to pull python:3.13-slim.
+    - No network API, third-party Python packages, or external services required.
+    - The default timestamp is fixed for reproducible sample CSV execution; use
+      a current batch time or empty evaluation_time for real workloads.
+
+    ### Secrets
+
+    - None. The supplied sample data is illustrative and requires no credentials.
 
     ## Quick start
-    1. Import this flow and run with defaults: all four rows are jointly usable.
-    2. Blank one customer_age value: the audit reports excessive nulls and joint
-       coverage 0.75; the execution fails without an approval manifest.
-    3. Replace a transaction timestamp with 2025-12-01T00:00:00Z to test staleness.
-    4. Supply your own CSV, contract, and evaluation time. The disabled UTC schedule
-       is illustrative; wire fresh candidate inputs before enabling automation.
 
-    ## Outputs and training integration
-    - Success: outputs.release_approval.uri (JSON approval manifest), also the
-      flow output approval_manifest. It references outputs.stage_candidate.uri.
-    - Every completed validation: outputs.validate_availability.outputFiles['audit.json'].
-      On rejected executions inspect this task artifact; flow-level outputs may
-      not be evaluated after failure. Partial audits have evaluation_complete=false
-      and do not imply that uncomputed metrics passed.
-    - Call this gate as a waiting Subflow from the training workflow with
-      transmitFailed=true, and place training after that successful call. Consume
-      only that execution's manifest, verify its dataset checksum, and train on
-      the referenced dataset. Never fall back to an older manifest or a mutable
-      source path. A separately scheduled gate cannot block independent training.
+    1. Import the flow and execute with default CSV, contract, and evaluation_time.
+    2. Inspect the approval manifest and audit.json on success.
+    3. Blank one customer_age cell; rerun and inspect the rejected audit and absent
+       approval manifest. Try an outdated transaction timestamp for a stale failure.
+    4. Supply an actual CSV and contract. Wire a fresh upstream dataset source
+       before enabling the disabled illustrative daily Schedule.
 
-    ## Limitations
-    CSV content is an execution input, so use bounded batches suitable for your
-    Kestra input limits. The validator streams rows but does not validate numeric
-    feature meaning or uniqueness. Approval covers the whole batch, including
-    tolerated unusable rows; it does not guarantee every row is ready for a trainer
-    requiring complete cases. Infrastructure failure before artifact upload may
-    leave no audit, but cannot release approval. Freshness is measured at evaluation
-    time; delayed training should revalidate. Storage retention applies to artifacts.
+    ## How to extend
+
+    - Replace CSV STRING input with an object-storage ingestion task for large files.
+    - Add Slack or email notification on failure and archive audit reports.
+    - Integrate a waiting Subflow before training, and verify approved dataset bytes.
+    - Add feature type, range, or point-in-time correctness checks separately;
+      this workflow does not detect target leakage or sanitize unusable rows.
 
     ## Links
+
     - [Python Script](https://kestra.io/plugins/plugin-script-python/io.kestra.plugin.scripts.python.script)
     - [Storage Write](https://kestra.io/plugins/core/storage/io.kestra.plugin.core.storage.write)
     - [Subflow](https://kestra.io/plugins/core/flow/io.kestra.plugin.core.flow.subflow)
+  tags:
+    - Data
+  subTags:
+    - Testing & Quality
+  ee: false
+  demo: false
