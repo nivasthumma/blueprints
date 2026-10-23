@@ -1,0 +1,36 @@
+name: Kestra Evidence Gate Fixture
+
+on:
+  push:
+    branches:
+      - test/github-actions-evidence-gate-fixture
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create real release bundle
+        run: |
+          mkdir -p dist
+          printf 'kestra-evidence-fixture\ncommit=%s\n' "$GITHUB_SHA" > dist/release.txt
+          test -s dist/release.txt
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-bundle
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify actual fixture behavior
+        run: |
+          test -n "$GITHUB_SHA"
+          test "$GITHUB_REF_NAME" = "test/github-actions-evidence-gate-fixture"
