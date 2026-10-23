@@ -1,0 +1,291 @@
+id: github-actions-artifact-retention-sentinel
+namespace: company.engineering
+description: Audit GitHub Actions artifact expiration and fail closed when required release evidence is missing or close to expiry.
+
+inputs:
+  - id: repository
+    type: STRING
+    description: Repository to audit in owner/repo format.
+    defaults: kestra-io/blueprints
+  - id: run_id
+    type: STRING
+    description: Specific Actions run ID. Use 0 for repository-wide monitoring; supply a real ID to pin evidence to a release.
+    defaults: "0"
+  - id: required_artifacts
+    type: JSON
+    description: Artifact names that must exist within the selected scope.
+    defaults:
+      - release-bundle
+  - id: warning_hours
+    type: INT
+    description: Flag artifacts expiring in this many hours or less, including already expired artifacts.
+    defaults: 48
+  - id: fail_on_risk
+    type: BOOL
+    description: Fail the execution when required evidence is absent, expired, or near expiry. An API or pagination failure always fails.
+    defaults: true
+
+triggers:
+  - id: daily_artifact_audit
+    type: io.kestra.plugin.core.trigger.Schedule
+    cron: "0 8 * * *"
+    timezone: UTC
+    disabled: true
+
+tasks:
+  - id: audit_artifacts
+    type: io.kestra.plugin.scripts.python.Script
+    description: Inspect the GitHub REST artifact inventory and write a complete audit report before making the gate decision.
+    containerImage: python:3.13-slim
+    taskRunner:
+      type: io.kestra.plugin.scripts.runner.docker.Docker
+    timeout: PT5M
+    env:
+      GITHUB_TOKEN: "{{ secret('GITHUB_TOKEN') }}"
+      REPOSITORY: "{{ inputs.repository }}"
+      RUN_ID: "{{ inputs.run_id }}"
+      REQUIRED_ARTIFACTS: "{{ inputs.required_artifacts | toJson }}"
+      WARNING_HOURS: "{{ inputs.warning_hours }}"
+    outputFiles:
+      - artifact-retention-report.json
+    script: |
+      import json
+      import os
+      import re
+      import urllib.error
+      import urllib.request
+      from datetime import datetime, timezone
+      from pathlib import Path
+
+      repository = os.environ["REPOSITORY"].strip()
+      run_id = os.environ["RUN_ID"].strip()
+      token = os.environ["GITHUB_TOKEN"]
+      required = json.loads(os.environ["REQUIRED_ARTIFACTS"])
+      warning_hours = int(os.environ["WARNING_HOURS"])
+
+      if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", repository):
+          raise ValueError("Repository must be owner/repo")
+      if not re.fullmatch(r"(0|[1-9][0-9]*)", run_id):
+          raise ValueError("run_id must be 0 or a positive integer")
+      if not isinstance(required, list) or not required or any(
+          not isinstance(v, str) or not v.strip() for v in required
+      ) or len(required) != len(set(required)):
+          raise ValueError("required_artifacts must be a nonempty list of unique names")
+      if warning_hours < 1 or warning_hours > 8760:
+          raise ValueError("warning_hours must be from 1 to 8760")
+      if not token:
+          raise ValueError("GITHUB_TOKEN is missing")
+
+      base = "https://api.github.com/repos/" + repository
+      scope = ("/actions/runs/" + run_id + "/artifacts") if run_id != "0" else "/actions/artifacts"
+
+      def fetch(path):
+          req = urllib.request.Request(
+              base + path,
+              headers={
+                  "Authorization": "Bearer " + token,
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "User-Agent": "kestra-artifact-retention-sentinel",
+              },
+          )
+          with urllib.request.urlopen(req, timeout=25) as response:
+              return json.load(response)
+
+      def parse_time(value):
+          if not isinstance(value, str) or not value:
+              return None
+          try:
+              return datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)
+          except ValueError:
+              return None
+
+      now = datetime.now(timezone.utc)
+      reasons = []
+      inventory = []
+      try:
+          if run_id != "0":
+              run = fetch("/actions/runs/" + run_id)
+              if run.get("repository", {}).get("full_name", "").lower() != repository.lower():
+                  reasons.append("RUN_REPOSITORY_MISMATCH")
+          for page in range(1, 11):
+              data = fetch(scope + "?per_page=100&page=" + str(page))
+              batch = data["artifacts"]
+              inventory.extend(batch)
+              if len(batch) < 100:
+                  if len(inventory) < int(data.get("total_count", len(inventory))):
+                      reasons.append("INCOMPLETE_ARTIFACT_INVENTORY")
+                  break
+          else:
+              reasons.append("ARTIFACT_INVENTORY_EXCEEDS_1000")
+      except (urllib.error.URLError, TimeoutError, ValueError, KeyError, TypeError) as exc:
+          reasons.append("GITHUB_API_OR_PAGINATION_FAILED:" + type(exc).__name__)
+
+      assessments = []
+      selected = []
+      for name in required:
+          candidates = [a for a in inventory if a.get("name") == name]
+          candidates.sort(key=lambda a: (a.get("created_at") or "", a.get("id") or 0), reverse=True)
+          if not candidates:
+              reasons.append("REQUIRED_ARTIFACT_MISSING:" + name)
+              assessments.append({"name": name, "status": "MISSING"})
+              continue
+
+          artifact = candidates[0]
+          expires_at = parse_time(artifact.get("expires_at"))
+          expiry_hours = round((expires_at - now).total_seconds() / 3600, 2) if expires_at else None
+          expired = artifact.get("expired") is True or (expiry_hours is not None and expiry_hours <= 0)
+          empty = (artifact.get("size_in_bytes") or 0) <= 0
+
+          if expired:
+              status = "EXPIRED"
+          elif empty:
+              status = "EMPTY"
+          elif expiry_hours is None:
+              status = "UNKNOWN_EXPIRY"
+          elif expiry_hours <= warning_hours:
+              status = "EXPIRING_SOON"
+          else:
+              status = "HEALTHY"
+
+          if status != "HEALTHY":
+              reasons.append("ARTIFACT_" + status + ":" + name)
+
+          row = {
+              "name": name, "artifact_id": artifact.get("id"),
+              "workflow_run_id": (artifact.get("workflow_run") or {}).get("id"),
+              "created_at": artifact.get("created_at"),
+              "expires_at": artifact.get("expires_at"),
+              "hours_remaining": expiry_hours,
+              "size_in_bytes": artifact.get("size_in_bytes"),
+              "status": status,
+          }
+          selected.append(row)
+          assessments.append({"name": name, "status": status, "artifact_id": artifact.get("id")})
+
+      report = {
+          "version": 1,
+          "repository": repository,
+          "run_id": run_id,
+          "audit_time_utc": now.isoformat(),
+          "warning_hours": warning_hours,
+          "inventory_count": len(inventory),
+          "required_artifacts": required,
+          "assessments": assessments,
+          "selected_artifacts": selected,
+          "risk_reasons": reasons,
+          "healthy": not reasons,
+          "note": "Repository-wide mode selects the newest matching artifact name; use a run_id for release-specific assurance.",
+      }
+      Path("artifact-retention-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+      print("::" + json.dumps({"outputs": {
+          "healthy": not reasons,
+          "reason_count": len(reasons),
+          "inventory_ok": not any(
+              item.startswith(("GITHUB_API_", "ARTIFACT_INVENTORY_EXCEEDS", "INCOMPLETE_ARTIFACT_INVENTORY", "RUN_REPOSITORY_MISMATCH"))
+              for item in reasons
+          ),
+      }}) + "::")
+
+  - id: audit_gate
+    type: io.kestra.plugin.core.flow.If
+    condition: "{{ outputs.audit_artifacts.vars.healthy == true }}"
+    then:
+      - id: record_healthy
+        type: io.kestra.plugin.core.output.OutputValues
+        values:
+          verdict: HEALTHY
+          report: "{{ outputs.audit_artifacts.outputFiles['artifact-retention-report.json'] }}"
+    else:
+      - id: retrieval_guard
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ outputs.audit_artifacts.vars.inventory_ok == false }}"
+        then:
+          - id: fail_unverified_inventory
+            type: io.kestra.plugin.core.execution.Fail
+            errorMessage: "GitHub artifact inventory could not be verified. Inspect {{ outputs.audit_artifacts.outputFiles['artifact-retention-report.json'] }}."
+      - id: risk_policy
+        type: io.kestra.plugin.core.flow.If
+        condition: "{{ inputs.fail_on_risk == true }}"
+        then:
+          - id: fail_at_risk
+            type: io.kestra.plugin.core.execution.Fail
+            errorMessage: "Required GitHub Actions artifacts are missing, expired, empty, or nearing expiry. Inspect {{ outputs.audit_artifacts.outputFiles['artifact-retention-report.json'] }}."
+        else:
+          - id: record_risk
+            type: io.kestra.plugin.core.output.OutputValues
+            values:
+              verdict: AT_RISK
+              report: "{{ outputs.audit_artifacts.outputFiles['artifact-retention-report.json'] }}"
+
+extend:
+  title: GitHub Actions Artifact Retention & Expiry Sentinel
+  metaTitle: GitHub Actions Artifact Retention and Expiry Monitoring | Kestra
+  shortDescription: Audit required GitHub Actions artifacts, warn before expiry, and optionally fail CI/release readiness checks.
+  metaDescription: Monitor GitHub Actions artifact expiration with run-specific evidence, audit JSON, and fail-closed API checks.
+  description: |
+    Detect missing or expiring GitHub Actions artifacts before they break release
+    recovery, audit trails, or required build evidence. Checks live GitHub REST
+    data and retains a structured JSON report in Kestra.
+
+    ## How it works
+
+    1. Supply a repository, required artifact names, and an expiry warning horizon.
+    2. Optionally supply a run_id to ensure evidence belongs to a specific
+       workflow run. Repository-wide monitoring uses the latest artifact per name.
+    3. The Python task pages through GitHub's artifact inventory and audits each
+       required artifact's expiry timestamp, expired flag, and file size.
+    4. Healthy runs emit a report. Risky runs fail by default; set fail_on_risk
+       false to record a non-failing AT_RISK verdict. API failures always fail.
+
+    ## What you get
+
+    - artifact-retention-report.json with selected artifact IDs and expiry times.
+    - Missing, expired, empty, unknown-expiry and expiring-soon classifications.
+    - Strict pagination checks and rejection of incomplete API inventories.
+    - Read-only operation: no artifact deletion, extension, or deployment.
+
+    ## Who it's for
+
+    DevOps, release engineering and compliance teams dependent on retained CI
+    evidence.
+
+    ## Prerequisites
+
+    - Kestra Python Script plugin and Docker-capable worker.
+    - GitHub fine-grained PAT with Actions read permission on target repository,
+      configured as secret GITHUB_TOKEN.
+    - A completed GitHub Actions run with artifacts for release-specific checks.
+
+    ### Security and scope
+
+    The GitHub API can omit deleted artifacts from results. A missing required
+    artifact is reported as MISSING, not as a confirmed historical expiry.
+    In repository-wide mode, the latest matching artifact name can belong to an
+    unrelated run. Set run_id for release verification.
+    The optional schedule is disabled: enable it only after configuring real
+    production inputs (especially run_id, which does not auto-update).
+
+    ## Quick start
+
+    1. Save a fine-grained GITHUB_TOKEN in Kestra secrets.
+    2. Execute with repository, run_id, required_artifacts and warning_hours.
+    3. Inspect artifact-retention-report.json in the task outputs.
+    4. Test a nonexistent required artifact to exercise failure handling.
+
+    ## How to extend
+
+    - Notify Slack or Teams for expiring artifacts without deleting them.
+    - Discover the latest successful CI run dynamically before auditing.
+    - Store historical snapshot data in Kestra KV to track retention drift.
+
+    ## Links
+
+    - [GitHub Actions artifacts REST API](https://docs.github.com/en/rest/actions/artifacts)
+    - [Python Script](https://kestra.io/plugins/plugin-script-python/io.kestra.plugin.scripts.python.script)
+  tags:
+    - Infrastructure
+  subTags:
+    - CI/CD & Deployment
+  ee: false
+  demo: false
